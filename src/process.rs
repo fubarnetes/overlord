@@ -24,6 +24,8 @@ pub struct _Process {
     pub exit_status: Option<i32>,
     pub restart_count: u64,
     pub max_restart_count: u64,
+    pub pid: Option<u32>,
+    child: Option<Arc<Mutex<process::Child>>>,
 }
 
 pub type Process = Arc<Mutex<_Process>>;
@@ -68,6 +70,8 @@ impl Runnable for Process {
             exit_status: None,
             restart_count: 0,
             max_restart_count: 5, // FIXME: this should be configurable
+            pid: None,
+            child: None,
         }))
     }
 
@@ -78,37 +82,55 @@ impl Runnable for Process {
             .name("overlord".to_string())
             .spawn(move || {
                 loop {
-                    let mut child = {
+                    // Run the process
+                    let child = {
                         let mut p = lockable.lock().unwrap();
                         let mut cmd = process::Command::new(&p.path);
                         cmd.args(&p.args[1..]);
                         if p.cwd.is_some() {
                             cmd.current_dir(p.cwd.as_ref().unwrap());
                         }
-                        let child = cmd.spawn().expect("Failed to run binary");
+                        let child = Arc::new(Mutex::new(cmd.spawn().expect("Failed to run binary")));
+
                         p.state = State::Running;
+                        p.pid = Some(child.lock().unwrap().id());
+                        p.child = Some(child.clone());
                         child
                     };
 
-                    let exit = child.wait();
-                    info!("exit code {:?}", exit);
-
-                    // Get the exit status
-                    let exit_status = match exit {
-                        Ok(status) => {
-                            if status.code().is_some() {
-                                let mut p = lockable.lock().unwrap();
-                                p.exit_status = Some(status.code().expect("Could not get exit status"));
-                                Ok(p.exit_status)
-                            } else {
-                                error!("Killed by Signal");
-                                Ok(None)
+                    // Wait for the process to exit
+                    //
+                    // Note: we can't really use child.lock().unwrap().wait() here as that would
+                    //   - close stdin
+                    //   - require a mutable copy of child, and therefore make it necessary to
+                    //     lock its Mutex, rendering it impossible to call e.g. kill() on from
+                    //     another thread.
+                    //
+                    // The shared_child crate is also unsuitable as it has quite a few shortcomings
+                    // (e.g. still using a Mutex as opposed to a RwLock) and it's really not that
+                    // critical that we're fast here.
+                    let exit_status = loop {
+                        thread::sleep(time::Duration::from_millis(10));
+                        match child.lock().unwrap().try_wait() {
+                            Ok(Some(status)) => {
+                                if status.code().is_some() {
+                                    let mut p = lockable.lock().unwrap();
+                                    p.exit_status = Some(status.code().expect("Could not get exit status"));
+                                    break Ok(p.exit_status);
+                                } else {
+                                    error!("Killed by Signal");
+                                    break Ok(None);
+                                }
+                            }
+                            Err(e) => {
+                                break Err(e);
+                            }
+                            Ok(None) => {
+                                continue;
                             }
                         }
-                        Err(e) => {
-                            Err(e)
-                        }
                     };
+                    info!("exit code {:?}", exit_status);
 
                     // Depending on the exit status, restart or fail the process
                     match exit_status {
