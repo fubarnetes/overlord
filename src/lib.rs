@@ -12,6 +12,7 @@ use std::thread;
 mod process;
 
 use process::Process;
+use process::Runnable;
 
 #[derive(Debug)]
 enum Command {
@@ -27,7 +28,7 @@ pub struct Overlord {
     processes: SharedProcessList,
 }
 
-type ProcessList = Vec<Arc<Process>>;
+type ProcessList = Vec<Process>;
 type SharedProcessList = Arc<Mutex<ProcessList>>;
 
 impl Overlord {
@@ -46,7 +47,8 @@ impl Overlord {
                         Command::Spawn(p) => {
                             trace!("Pushed {:?}", p);
                             let mut plist = processes.lock().unwrap();
-                            plist.push(Arc::new(p));
+                            plist.push(p.clone());
+                            p.launch();
                         }
                         Command::Quit => {
                             trace!("Terminating");
@@ -88,7 +90,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run() {
+    fn test_run_ls_max_retries() {
         let _ = pretty_env_logger::init();
         let instance = Overlord::new();
 
@@ -98,16 +100,44 @@ mod tests {
             assert_eq!(processes.len(), 0);
         }
 
-        let p = from_argv!(["ls", "-la"], "/");
+        // Run ls every second
+        let interval = 1000;
+        let p = from_argv!(["ls", "-la"], "/", interval);
+
+        info!("Created {:?}", p);
 
         instance.spawn(p);
-        // Sleep a bit to allow the overlord thread to handle stuff
-        sleep!(10);
+
+        // Sleep a bit to allow the overlord thread to handle stuff.
+        sleep!(interval/2);
+
+        // At this point the process should have restarted exactly once
+        {
+            let processes = instance.processes.lock().unwrap();
+            assert_eq!(processes.len(), 1);
+
+            let p = &processes[0].lock().unwrap();
+            assert_eq!(p.name, "ls");
+            assert_eq!(p.state, process::State::Restarting);
+            assert_eq!(p.exit_status, Some(0));
+            assert_eq!(p.restart_count, 1);
+        }
+
+        sleep!({
+                let processes = instance.processes.lock().unwrap();
+                let p = &processes[0].lock().unwrap();
+                p.max_restart_count
+            }*interval);
 
         {
             let processes = instance.processes.lock().unwrap();
-            info!("the following processes exist: {:?}", *processes);
             assert_eq!(processes.len(), 1);
+
+            let p = &processes[0].lock().unwrap();
+            assert_eq!(p.name, "ls");
+            assert_eq!(p.state, process::State::Failed);
+            assert_eq!(p.exit_status, Some(0));
+            assert_eq!(p.restart_count, p.max_restart_count);
         }
 
         instance.quit();
