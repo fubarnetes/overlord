@@ -1,7 +1,8 @@
 use std::process;
 use std::time;
-use std::sync::{Mutex,Arc};
+use std::sync::{Mutex,Arc,mpsc};
 use std::thread;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 
 #[derive(Debug, PartialEq)]
 pub enum State {
@@ -25,6 +26,20 @@ pub struct _Process {
     pub restart_count: u64,
     pub max_restart_count: u64,
     pub pid: Option<u32>,
+
+    // stdio MPSC channels
+    pub stdin: mpsc::Sender<String>,
+    pub stdout: mpsc::Receiver<String>,
+    pub stderr: mpsc::Receiver<String>,
+    stdin_receiver: mpsc::Receiver<String>,
+    stdout_sender: mpsc::Sender<String>,
+    stderr_sender: mpsc::Sender<String>,
+
+    // stdio BufWriters and BufReaders
+    stdin_writer: Option<BufWriter<process::ChildStdin>>,
+    stdout_reader: Option<BufReader<process::ChildStdout>>,
+    stderr_reader: Option<BufReader<process::ChildStderr>>,
+
     child: Option<Arc<Mutex<process::Child>>>,
 }
 
@@ -59,6 +74,12 @@ macro_rules! from_argv {
 impl Runnable for Process {
     fn define_process(name: &str, path: &str, args: Vec<String>,
            restart_delay: Option<u64>, cwd: Option<String>) -> Process {
+
+        // set up stdio channels
+        let (stdin, stdin_receiver) = mpsc::channel();
+        let (stdout_sender, stdout) = mpsc::channel();
+        let (stderr_sender, stderr) = mpsc::channel();
+
         return Arc::new(Mutex::new(_Process {
             handle: None,
             name: name.to_string(),
@@ -71,6 +92,18 @@ impl Runnable for Process {
             restart_count: 0,
             max_restart_count: 5, // FIXME: this should be configurable
             pid: None,
+
+            stdin: stdin,
+            stdout: stdout,
+            stderr: stderr,
+            stdin_receiver: stdin_receiver,
+            stdout_sender: stdout_sender,
+            stderr_sender: stderr_sender,
+
+            stdin_writer: None,
+            stdout_reader: None,
+            stderr_reader: None,
+
             child: None,
         }))
     }
@@ -87,10 +120,24 @@ impl Runnable for Process {
                         let mut p = lockable.lock().unwrap();
                         let mut cmd = process::Command::new(&p.path);
                         cmd.args(&p.args[1..]);
+
+                        // If a working directory is specified, set it.
                         if p.cwd.is_some() {
                             cmd.current_dir(p.cwd.as_ref().unwrap());
                         }
+
+                        // Set up stdin, stdout, and stderr
+                        cmd.stdin(process::Stdio::piped());
+                        cmd.stdout(process::Stdio::piped());
+                        cmd.stderr(process::Stdio::piped());
+
+                        // Spawn the child
                         let child = Arc::new(Mutex::new(cmd.spawn().expect("Failed to run binary")));
+
+                        // Set up BufReaders and BufWriters for stdin, stdout and stderr
+                        p.stdin_writer = Some(BufWriter::new(child.lock().unwrap().stdin.take().unwrap()));
+                        p.stdout_reader = Some(BufReader::new(child.lock().unwrap().stdout.take().unwrap()));
+                        p.stderr_reader = Some(BufReader::new(child.lock().unwrap().stderr.take().unwrap()));
 
                         p.state = State::Running;
                         p.pid = Some(child.lock().unwrap().id());
@@ -98,29 +145,61 @@ impl Runnable for Process {
                         child
                     };
 
-                    // Wait for the process to exit
-                    //
-                    // Note: we can't really use child.lock().unwrap().wait() here as that would
-                    //   - close stdin
-                    //   - require a mutable copy of child, and therefore make it necessary to
-                    //     lock its Mutex, rendering it impossible to call e.g. kill() on from
-                    //     another thread.
-                    //
-                    // The shared_child crate is also unsuitable as it has quite a few shortcomings
-                    // (e.g. still using a Mutex as opposed to a RwLock) and it's really not that
-                    // critical that we're fast here.
+                    // Process supervisor main loop
                     let exit_status = loop {
                         thread::sleep(time::Duration::from_millis(10));
+
+                        let mut p = lockable.lock().unwrap();
+                        // p is a MutexGuard<_Process>, so each access to fields of _Process calls
+                        // deref / deref_mut to get the underlying _Process. To avoid borrowing
+                        // conflicts, get a reference to the underlying _Process struct once.
+                        let p = &mut *p;
+
+                        // Handle stdio
+                        if let Some(ref mut stdout) = p.stdout_reader {
+                            for line in stdout.lines() {
+                                p.stdout_sender
+                                    .send(line.unwrap())
+                                    .expect("Could not send stdout");
+                            }
+                        }
+
+                        if let Some(ref mut stderr) = p.stderr_reader {
+                            for line in stderr.lines() {
+                                p.stderr_sender
+                                    .send(line.unwrap())
+                                    .expect("Could not send stderr");
+                            }
+                        }
+
+                        if let Some(ref mut stdin) = p.stdin_writer {
+                            if let Ok(input) = p.stdin_receiver.try_recv() {
+                                info!("received: {}", input);
+                                stdin.write_all(input.as_bytes())
+                                    .expect("Could not write to stdin");
+                            }
+                        }
+
+                        // Check if the process has already exited
+                        //
+                        // Note: we can't really use child.lock().unwrap().wait() here as that would
+                        //   - close stdin
+                        //   - require a mutable copy of child, and therefore make it necessary to
+                        //     lock its Mutex, rendering it impossible to call e.g. kill() on from
+                        //     another thread.
+                        //
+                        // The shared_child crate is also unsuitable as it has quite a few shortcomings
+                        // (e.g. still using a Mutex as opposed to a RwLock) and it's really not that
+                        // critical that we're fast here.
                         match child.lock().unwrap().try_wait() {
                             Ok(Some(status)) => {
-                                if status.code().is_some() {
-                                    let mut p = lockable.lock().unwrap();
-                                    p.exit_status = Some(status.code().expect("Could not get exit status"));
-                                    break Ok(p.exit_status);
+                                p.exit_status = if status.code().is_some() {
+                                    Some(status.code().expect("Could not get exit status"))
                                 } else {
                                     error!("Killed by Signal");
-                                    break Ok(None);
-                                }
+                                    None
+                                };
+                                break Ok(p.exit_status);
                             }
                             Err(e) => {
                                 break Err(e);
@@ -167,5 +246,51 @@ impl Runnable for Process {
                 }
             }).expect("Failed to spawn process"));
             self.lock().unwrap().handle = handle;
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::time;
+    use super::*;
+    extern crate pretty_env_logger;
+
+    macro_rules! sleep {
+        ( $ms:expr ) => ({
+            let duration = time::Duration::from_millis($ms);
+            thread::sleep(duration);
+        })
+    }
+
+    #[test]
+    fn test_run_ls_max_retries() {
+        let interval = 1000;
+        let p = from_argv!(["ls", "-la"], "/", interval);
+
+        p.clone().launch();
+
+        sleep!(interval*p.lock().unwrap().max_restart_count);
+        sleep!(interval);
+
+        info!("{:?}",p);
+    }
+
+    #[test]
+    fn test_exitstatus() {
+        let p = from_argv!(["false"]);
+        p.lock().unwrap().max_restart_count = 0;
+        p.clone().launch();
+        sleep!(500);
+        assert_eq!(p.lock().unwrap().exit_status, Some(1));
+    }
+
+    #[test]
+    fn test_echo() {
+        let p = from_argv!(["echo", "test"], "/");
+        p.lock().unwrap().max_restart_count = 0;
+        p.clone().launch();
+        sleep!(500);
+        assert_eq!(p.lock().unwrap().stdout.recv(), Ok("test".to_string()));
     }
 }
