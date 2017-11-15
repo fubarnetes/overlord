@@ -150,21 +150,34 @@ impl Runnable for Process {
                         thread::sleep(time::Duration::from_millis(10));
 
                         let mut p = lockable.lock().unwrap();
+                        // p is a MutexGuard<_Process>, so each access to fields of _Process calls
+                        // deref / deref_mut to get the underlying _Process. To avoid borrowing
+                        // conflicts, get a reference to the underlying _Process struct once.
+                        let p = &mut *p;
 
                         // Handle stdio
                         if let Some(ref mut stdout) = p.stdout_reader {
                             for line in stdout.lines() {
-                                info!("{:?}", line)
+                                p.stdout_sender
+                                    .send(line.unwrap())
+                                    .expect("Could not send stdout");
                             }
                         }
 
                         if let Some(ref mut stderr) = p.stderr_reader {
                             for line in stderr.lines() {
-                                error!("{:?}", line)
+                                p.stderr_sender
+                                    .send(line.unwrap())
+                                    .expect("Could not send stderr");
                             }
                         }
 
                         if let Some(ref mut stdin) = p.stdin_writer {
+                            if let Ok(input) = p.stdin_receiver.try_recv() {
+                                info!("received: {}", input);
+                                stdin.write_all(input.as_bytes())
+                                    .expect("Could not write to stdin");
+                            }
                         }
 
                         // Check if the process has already exited
@@ -233,5 +246,51 @@ impl Runnable for Process {
                 }
             }).expect("Failed to spawn process"));
             self.lock().unwrap().handle = handle;
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::time;
+    use super::*;
+    extern crate pretty_env_logger;
+
+    macro_rules! sleep {
+        ( $ms:expr ) => ({
+            let duration = time::Duration::from_millis($ms);
+            thread::sleep(duration);
+        })
+    }
+
+    #[test]
+    fn test_run_ls_max_retries() {
+        let interval = 1000;
+        let p = from_argv!(["ls", "-la"], "/", interval);
+
+        p.clone().launch();
+
+        sleep!(interval*p.lock().unwrap().max_restart_count);
+        sleep!(interval);
+
+        info!("{:?}",p);
+    }
+
+    #[test]
+    fn test_exitstatus() {
+        let p = from_argv!(["false"]);
+        p.lock().unwrap().max_restart_count = 0;
+        p.clone().launch();
+        sleep!(500);
+        assert_eq!(p.lock().unwrap().exit_status, Some(1));
+    }
+
+    #[test]
+    fn test_echo() {
+        let p = from_argv!(["echo", "test"], "/");
+        p.lock().unwrap().max_restart_count = 0;
+        p.clone().launch();
+        sleep!(500);
+        assert_eq!(p.lock().unwrap().stdout.recv(), Ok("test".to_string()));
     }
 }
