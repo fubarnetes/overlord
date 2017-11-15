@@ -8,3 +8,8 @@ log = "0.3"
 
 [dev-dependencies]
 pretty_env_logger = "*"
+
+[badges]
+travis-ci = { repository = "fubarnetes/overlord", branch = "master" }
+codecov = { repository = "fubarnetes/overlord", branch = "master", service = "github" }
+
